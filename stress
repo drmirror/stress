@@ -1,0 +1,138 @@
+#!/usr/local/bin/python3
+
+import argparse
+from random import random, randint
+import time
+from multiprocessing import Process
+
+from pymongo import MongoClient
+
+class Stress:
+
+    def __init__ (self, uri, ns, id_field, update_spec, ratio, ops):
+        self.uri = uri
+        self.client = None
+        self.ns = ns.split(".")
+        self.id_field = id_field
+        if update_spec:
+            update = update_spec.split(":")
+            self.update_field = update[0]
+            self.update_type = update[1]
+        self.ratio = ratio
+        self.ops = ops
+
+    def connect (self):
+        if self.client:
+            self.client.close()
+        self.client = MongoClient(self.uri)
+        self.coll = self.client[self.ns[0]][self.ns[1]]
+
+    def disconnect (self):
+        if self.client:
+            self.client.close()
+        self.client = None
+        self.coll = None
+
+    def fetch_ids (self):
+        projection = {} if self.id_field == "_id" else { "_id" : 0, self.id_field : 1 }
+        self.ids = list(filter(
+            lambda q : q,
+            [ x.get(self.id_field) for x in self.coll.find({}, projection) ]))
+
+    def random_query(self):
+        index = randint(0, len(self.ids)-1)
+        value = self.ids[index]
+        return { self.id_field : value }
+        
+    def do_find (self):
+        if len(self.ids) > 0:
+            result = [ x for x in self.coll.find(self.random_query()) ]
+
+    def random_value(self):
+        if self.update_type == "boolean":
+            return random() < 0.5
+        else:
+            return random()
+            
+    def do_update(self):
+        if len(self.ids) > 0:
+            self.coll.update_one(
+                self.random_query(),
+                { '$set' : { self.update_field : self.random_value() }})
+
+    def measure_operation_throughput(self, func, interval=1.0):
+        start = time.time()
+        numOperations = 0
+        while time.time() - start < interval:
+            func(self)
+            numOperations += 1
+        return numOperations / interval
+
+    def measure_throughput(self, interval=1.0):
+        if self.ratio == 0:
+            return self.measure_operation_throughput(Stress.do_find, interval)
+        elif self.ratio == 1:
+            return self.measure_operation_throughput(Stress.do_update, interval)
+        else:
+            read_throughput = self.measure_operation_throughput(Stress.do_find, interval)
+            write_throughput = self.measure_operation_throughput(Stress.do_update, interval)
+            return self.ratio * write_throughput + (1-self.ratio) * read_throughput
+    
+    def loop (self, delay=0.0):
+        while True:
+            if random() < self.ratio:
+                self.do_update()
+            else:
+                self.do_find()
+            time.sleep(delay)
+
+    def connect_and_loop(self, delay=0.0):
+        self.connect()
+        self.loop(delay)
+            
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(description="MongoDB stress test")
+    parser.add_argument("--uri", default="mongodb://localhost:27017")
+    parser.add_argument("--ns")
+    parser.add_argument("--id", default="_id")
+    parser.add_argument("--update")
+    parser.add_argument("--ratio", type=float)
+    parser.add_argument("--ops")
+
+    args = parser.parse_args()
+            
+    s = Stress(args.uri, args.ns, args.id, args.update, args.ratio, args.ops)
+
+    s.connect()
+    s.fetch_ids()
+    t_actual = s.measure_throughput(1.0)
+    print("throughput: " + str(t_actual) + " op/s")
+
+    if args.ops:
+        t_desired = float(args.ops)
+
+        if (t_desired < t_actual):
+            delay = 1.0 / t_desired - 1.0 / t_actual
+            print ("single worker, delay: " + str(delay))
+            s.loop(delay)
+        else:
+            numWorkers = int(t_desired / t_actual)
+            if numWorkers == 1:
+                print ("single worker, maximum throughput")
+                s.loop()
+            else:
+                print (str(numWorkers) + " workers")
+                s.disconnect()
+                for w in range(0,numWorkers):
+                    p = Process(target=Stress.connect_and_loop, args=(s,))
+                    p.start()
+
+    else:
+        print("single worker, maximum throughput")
+        s.loop()
+
+
+            
+
+
